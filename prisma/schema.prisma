@@ -8,28 +8,47 @@ datasource db {
 }
 
 model AmcRequest {
-  id         String    @id @default(cuid())
-  leadId     String
-  customerId String
-  status     AmcStatus @default(pending)
-  note       String?
-  createdAt  DateTime  @default(now())
-  updatedAt  DateTime  @updatedAt
-  resolvedAt DateTime?
-  customer   Customer  @relation(fields: [customerId], references: [id])
-  lead       Booking   @relation(fields: [leadId], references: [id])
+  id              String    @id @default(cuid())
+  leadId          String
+  customerId      String
+  assignedStaffId String?
+  status          AmcStatus @default(pending)
+  note            String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  resolvedAt      DateTime?
+  customer        Customer  @relation(fields: [customerId], references: [id])
+  lead            Booking   @relation(fields: [leadId], references: [id])
+  assignedStaff   Staff?    @relation(fields: [assignedStaffId], references: [id])
 
   @@index([leadId])
   @@index([customerId])
+  @@index([assignedStaffId])
 }
 
 model Customer {
-  id          String       @id @default(cuid())
-  mobile      String       @unique
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-  amcRequests AmcRequest[]
-  leads       Booking[]
+  id           String       @id @default(cuid())
+  mobile       String       @unique
+
+  // MLM referral system
+  referralCode String?      @unique
+  referredBy   String?
+  level        Int          @default(0) // depth from original referrer (0 = root, 1 = A1, 2 = A2, ...)
+
+  // self-referential relations for upline / downline
+  referredByCustomer Customer?  @relation("CustomerReferrals", fields: [referredBy], references: [id])
+  downlines          Customer[] @relation("CustomerReferrals")
+
+  // wallet & commissions
+  wallet                     Wallet?
+  commissionsReceived        Commission[] @relation("CommissionReceiver")
+  commissionsFromDownline    Commission[] @relation("CommissionSource")
+
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  amcRequests  AmcRequest[]
+  leads        Booking[]
+  Complaint    Complaint[]
 }
 
 model Partner {
@@ -53,14 +72,16 @@ model Admin {
 }
 
 model Staff {
-  id           String    @id @default(cuid())
-  email        String    @unique
-  name         String
-  phone        String?
-  passwordHash String
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  assignedBookings Booking[] @relation("StaffBookings")
+  id               String           @id @default(cuid())
+  email            String           @unique
+  name             String
+  phone            String?
+  passwordHash     String
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  assignedBookings Booking[]        @relation("StaffBookings")
+  amcRequests      AmcRequest[]
+  timesheets       StaffTimesheet[]
 }
 
 model Post {
@@ -75,16 +96,17 @@ model Post {
 }
 
 model Booking {
-  id                     String       @id @default(cuid())
+  id                     String         @id @default(cuid())
   customerId             String?
+  bookingCode            String?        @unique
   projectType            String
   sizedKW                Float
   monthlyBill            Int
-  billingCycleMonths     Int           @default(1) // 1 or 2
+  billingCycleMonths     Int            @default(1) // 1 or 2
   pincode                String
   provider               PanelProvider?
   budgetINR              Int?
-  withSubsidy            Boolean      @default(true)
+  withSubsidy            Boolean        @default(true)
   estimateINR            Int
   wp                     Int?
   plates                 Int?
@@ -101,6 +123,7 @@ model Booking {
   gstPct                 Float?
   gstAmount              Int?
   totalInvestment        Int?
+  totalPayable           Int?
   fullName               String
   phone                  String
   email                  String?
@@ -111,17 +134,18 @@ model Booking {
   country                String
   zip                    String
   // Assignment
-  assigned               Boolean      @default(false)
+  assigned               Boolean        @default(false)
   assignedStaffId        String?
-  assignedStaff          Staff?       @relation("StaffBookings", fields: [assignedStaffId], references: [id])
-  percent                Int          @default(0)
-  createdAt              DateTime     @default(now())
-  updatedAt              DateTime     @updatedAt
+  assignedStaff          Staff?         @relation("StaffBookings", fields: [assignedStaffId], references: [id])
+  percent                Int            @default(0)
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
   certificateUrl         String?
   certificateGeneratedAt DateTime?
   amcRequests            AmcRequest[]
-  customer               Customer?    @relation(fields: [customerId], references: [id])
+  customer               Customer?      @relation(fields: [customerId], references: [id])
   steps                  LeadStep[]
+  complaints             Complaint[]
 
   @@index([customerId])
   @@index([assignedStaffId])
@@ -130,19 +154,97 @@ model Booking {
 }
 
 model LeadStep {
-  id               String    @id @default(cuid())
-  leadId           String
-  name             String
-  order            Int
-  completed        Boolean   @default(false)
-  completedAt      DateTime?
-  completionNotes  String?
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
-  lead             Booking   @relation(fields: [leadId], references: [id])
+  id              String      @id @default(cuid())
+  leadId          String
+  name            String
+  order           Int
+  completed       Boolean     @default(false)
+  completedAt     DateTime?
+  completionNotes String?
+  dueDays         Int         @default(0) // 0 = not started/on-time, 1-5 = urgency level
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  lead            Booking     @relation(fields: [leadId], references: [id])
+  medias          StepMedia[]
 
   @@unique([leadId, order])
   @@index([leadId])
+}
+
+model StepMedia {
+  id        String   @id @default(cuid())
+  stepId    String
+  type      String // 'image' or 'video'
+  url       String
+  createdAt DateTime @default(now())
+
+  step LeadStep @relation(fields: [stepId], references: [id])
+
+  @@index([stepId])
+}
+
+model Complaint {
+  id         String          @id @default(cuid())
+  leadId     String
+  customerId String
+  message    String
+  status     ComplaintStatus @default(pending)
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  lead       Booking         @relation(fields: [leadId], references: [id])
+  customer   Customer        @relation(fields: [customerId], references: [id])
+
+  @@index([leadId])
+  @@index([customerId])
+}
+
+model StaffTimesheet {
+  id        String   @id @default(cuid())
+  staffId   String
+  date      DateTime
+  seconds   Int
+  source    String?
+  meta      Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  staff Staff @relation(fields: [staffId], references: [id])
+
+  @@unique([staffId, date])
+  @@index([staffId, date])
+}
+
+model Wallet {
+  id         String   @id @default(cuid())
+  customerId String   @unique
+  balance    Float    @default(0)
+  updatedAt  DateTime @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id])
+}
+
+model Commission {
+  id                String   @id @default(cuid())
+  customerId        String   // upline who earns
+  fromCustomerId    String   // downline who triggered earning
+  levelFromDownline Int      // A1/A2/A3 depth
+  amount            Float
+  createdAt         DateTime @default(now())
+
+  customer     Customer @relation("CommissionReceiver", fields: [customerId], references: [id])
+  fromCustomer Customer @relation("CommissionSource", fields: [fromCustomerId], references: [id])
+
+  @@index([customerId])
+  @@index([fromCustomerId])
+}
+
+model MlSettings {
+  id               String   @id @default(cuid())
+  maxPayoutPercent Float    @default(4.0) // max payout across all levels
+  level1Percent    Float    @default(2.0) // A1
+  level2Percent    Float    @default(1.0) // A2
+  level3Percent    Float    @default(1.0) // A3
+  updatedAt        DateTime @updatedAt
 }
 
 enum AmcStatus {
@@ -152,13 +254,17 @@ enum AmcStatus {
   rejected
 }
 
+enum ComplaintStatus {
+  pending
+  in_progress
+  resolved
+}
 
 enum PanelProvider {
-  waare
-  tata
-  satvik
-  rayzon
-  navitas
-  pahal
-  vikram
+  purvanchal_vv
+  torrent_power
+  paschimanchal
+  mvvnl
+  dvvnl
+  npcl
 }
