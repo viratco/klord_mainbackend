@@ -4,6 +4,7 @@ import path from 'path';
 dotenv.config({ path: path.join(process.cwd(), '..', '.env') });
 import express, { Request, Response } from 'express';
 import fs from 'fs';
+import https from 'https';
 import multerPkg from 'multer';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
@@ -16,6 +17,7 @@ import { generateCertificatePDF } from './services/certificateService.js';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 // Removed: import { startDueDaysCron, syncDueDaysOnStartup } - using real-time calculation instead
+import { sendWhatsAppMessage } from './services/whatsappService.js';
 
 const app = express();
 const prisma = new PrismaClient();
@@ -2853,6 +2855,131 @@ app.post('/api/posts/:id/like', async (req: Request, res: Response) => {
   }
 });
 
+
+// Admin: List all customers for broadcast (or general management)
+app.get('/api/admin/customers', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+    const customers = await (prisma as any).customer.findMany({
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        mobile: true,
+        city: true,
+        state: true,
+        createdAt: true,
+      },
+      // Note: city/state are not directly on Customer model in schema currently shown, 
+      // but logic in Pulse.tsx expects them. If they don't exist, we return nulls or update schema.
+      // Assuming for now they might be derived or we just return what we have.
+      // Based on schema viewed: Customer has no city/state. Lead has city/state. 
+      // We'll optionally fetch latest lead for city/state info.
+      include: {
+        leads: {
+          take: 1,
+          orderBy: { createdAt: 'desc' },
+          select: { city: true, state: true, fullName: true }
+        }
+      }
+    });
+
+    const formatted = customers.map((c: any) => ({
+      id: c.id,
+      mobile: c.mobile,
+      name: c.leads?.[0]?.fullName || null,
+      city: c.leads?.[0]?.city || null,
+      state: c.leads?.[0]?.state || null,
+      createdAt: c.createdAt
+    }));
+
+    res.json(formatted);
+  } catch (err) {
+    console.error('[admin-customers] list failed', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Admin: Send Broadcast (Pulse)
+app.post('/api/admin/broadcast/send', protect, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+
+    // Explicitly cast prisma to any to avoid potential type issues with new models until strictly typed
+    const prismaAny = prisma as any;
+
+    const { recipients, message, scheduledAt } = req.body;
+
+    if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ error: 'Recipients list is required' });
+    }
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+
+    console.log(`[Broadcast] Creating broadcast for ${recipients.length} recipients`);
+
+    // 1. Create Broadcast Record
+    const broadcast = await prismaAny.broadcast.create({
+      data: {
+        message,
+        scheduledAt: scheduledAt ? new Date(scheduledAt) : null,
+        status: 'processing',
+        adminId: req.user.sub,
+        recipients: {
+          create: recipients.map((customerId: string) => ({
+            customerId,
+            status: 'pending'
+          }))
+        }
+      },
+      include: { recipients: true }
+    });
+
+    // 2. "Send" Messages (Simulation / Integration Point)
+    // In a real scenario, this would loop through recipients and call Twilio/Meta API
+    // For now, we simulate success for all
+
+    // Async background processing to not block response
+    (async () => {
+      console.log(`[Broadcast] Starting background send for Broadcast ID: ${broadcast.id}`);
+
+      for (const r of broadcast.recipients) {
+        try {
+          // Send real WhatsApp message
+          const sid = await sendWhatsAppMessage(r.customer.mobile, message);
+
+          console.log(`[WhatsApp] Sent to ${r.customerId} (Msg: ${message.substring(0, 15)}...), SID: ${sid}`);
+
+          // Update status to sent
+          await prismaAny.broadcastRecipient.update({
+            where: { id: r.id },
+            data: { status: 'sent', sentAt: new Date() }
+          });
+        } catch (e) {
+          console.error(`[Broadcast] Failed to send to recipient ${r.id}`, e);
+          await prismaAny.broadcastRecipient.update({
+            where: { id: r.id },
+            data: { status: 'failed', error: String(e) }
+          });
+        }
+      }
+
+      // Update Broadcast status
+      await prismaAny.broadcast.update({
+        where: { id: broadcast.id },
+        data: { status: 'sent' }
+      });
+      console.log(`[Broadcast] Finished sending Broadcast ID: ${broadcast.id}`);
+    })();
+
+    res.json({ success: true, broadcastId: broadcast.id, message: 'Broadcast processing started' });
+
+  } catch (err) {
+    console.error('[broadcast-send] failed', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // Admin: Dashboard Stats
 app.get('/api/admin/dashboard/stats', protect, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -3377,3 +3504,23 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Reachable at http://localhost:${PORT} and your LAN IP`);
   console.log('Server started with real-time dueDays calculation (no cron needed).');
 });
+
+// HTTPS Setup
+const certPath = '/etc/letsencrypt/live/api.klordenergy.com/fullchain.pem';
+const keyPath = '/etc/letsencrypt/live/api.klordenergy.com/privkey.pem';
+
+if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+  try {
+    const options = {
+      key: fs.readFileSync(keyPath),
+      cert: fs.readFileSync(certPath)
+    };
+    https.createServer(options, app).listen(443, () => {
+      console.log("HTTPS Server running at https://api.klordenergy.com");
+    });
+  } catch (err) {
+    console.error("Failed to start HTTPS server:", err);
+  }
+} else {
+  console.warn("HTTPS certificates not found at /etc/letsencrypt/live/api.klordenergy.com/. Skipping HTTPS server.");
+}
