@@ -16,8 +16,8 @@ import { JWT_SECRET } from './config.js';
 import { generateCertificatePDF } from './services/certificateService.js';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-// Removed: import { startDueDaysCron, syncDueDaysOnStartup } - using real-time calculation instead
 // WhatsApp sending removed per user request
+import { sendEmailOTP } from './services/emailService.js';
 
 const app = express();
 const prisma = new PrismaClient();
@@ -2595,15 +2595,70 @@ app.post('/api/auth/admin/login', async (req: Request, res: Response) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Issue a token
-    const token = jwt.sign({ sub: admin.id, email: admin.email, type: 'admin' }, JWT_SECRET, { expiresIn: '1d' });
+    // Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    // Return the token and a sanitized user object
-    res.json({ token, user: { id: admin.id, email: admin.email, name: admin.name, type: 'admin' } });
+    await (prisma as any).admin.update({
+      where: { id: admin.id },
+      data: { otp, otpExpires }
+    });
+
+    try {
+      await sendEmailOTP(admin.email, otp);
+      // Return a message indicating OTP is required
+      res.json({ otpRequired: true, message: 'OTP sent to your email' });
+    } catch (emailErr) {
+      console.error('[admin-login] Email failed:', emailErr);
+      // For development/debugging if SES isn't verified yet
+      if (process.env.NODE_ENV === 'development') {
+        return res.json({ otpRequired: true, message: `(DEV ONLY) OTP: ${otp}` });
+      }
+      res.status(500).json({ error: 'Failed to send verification email' });
+    }
 
   } catch (error) {
     console.error('[admin-login] Error:', error);
     res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+app.post('/api/auth/admin/verify-otp', async (req: Request, res: Response) => {
+  const { email, otp } = req.body;
+
+  if (!email || !otp) {
+    return res.status(400).json({ error: 'Email and OTP are required' });
+  }
+
+  try {
+    const admin = await (prisma as any).admin.findUnique({
+      where: { email }
+    });
+
+    if (!admin || !admin.otp || !admin.otpExpires) {
+      return res.status(401).json({ error: 'Invalid or expired OTP' });
+    }
+
+    if (admin.otp !== otp) {
+      return res.status(401).json({ error: 'Invalid OTP' });
+    }
+
+    if (new Date() > admin.otpExpires) {
+      return res.status(401).json({ error: 'OTP has expired' });
+    }
+
+    // Clear OTP and issue token
+    await (prisma as any).admin.update({
+      where: { id: admin.id },
+      data: { otp: null, otpExpires: null }
+    });
+
+    const token = jwt.sign({ sub: admin.id, email: admin.email, type: 'admin' }, JWT_SECRET, { expiresIn: '1d' });
+    res.json({ token, user: { id: admin.id, email: admin.email, name: admin.name, type: 'admin' } });
+
+  } catch (error) {
+    console.error('[admin-verify-otp] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
