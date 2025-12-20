@@ -49,6 +49,7 @@ model Customer {
   amcRequests  AmcRequest[]
   leads        Booking[]
   Complaint    Complaint[]
+  broadcastRecipients BroadcastRecipient[]
 }
 
 model Partner {
@@ -267,4 +268,33 @@ enum PanelProvider {
   mvvnl
   dvvnl
   npcl
+}
+
+model Broadcast {
+  id          String   @id @default(cuid())
+  message     String
+  scheduledAt DateTime?
+  status      String   @default("pending") // pending, sent, failed
+  adminId     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  recipients BroadcastRecipient[]
+}
+
+model BroadcastRecipient {
+  id          String   @id @default(cuid())
+  broadcastId String
+  customerId  String
+  status      String   @default("pending") // pending, sent, failed, delivered, read
+  sentAt      DateTime?
+  error       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  broadcast Broadcast @relation(fields: [broadcastId], references: [id])
+  customer  Customer  @relation(fields: [customerId], references: [id])
+
+  @@index([broadcastId])
+  @@index([customerId])
 }

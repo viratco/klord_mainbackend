@@ -17,7 +17,7 @@ import { generateCertificatePDF } from './services/certificateService.js';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 // Removed: import { startDueDaysCron, syncDueDaysOnStartup } - using real-time calculation instead
-import { sendWhatsAppMessage } from './services/whatsappService.js';
+// WhatsApp sending removed per user request
 
 const app = express();
 const prisma = new PrismaClient();
@@ -2945,10 +2945,9 @@ app.post('/api/admin/broadcast/send', protect, async (req: AuthenticatedRequest,
 
       for (const r of broadcast.recipients) {
         try {
-          // Send real WhatsApp message
-          const sid = await sendWhatsAppMessage(r.customer.mobile, message);
-
-          console.log(`[WhatsApp] Sent to ${r.customerId} (Msg: ${message.substring(0, 15)}...), SID: ${sid}`);
+          // WhatsApp sending removed per user request
+          // We just mark as sent to keep the flow consistent for now
+          console.log(`[WhatsApp-Removed] Simulated send to ${r.customerId}`);
 
           // Update status to sent
           await prismaAny.broadcastRecipient.update({
@@ -2956,7 +2955,7 @@ app.post('/api/admin/broadcast/send', protect, async (req: AuthenticatedRequest,
             data: { status: 'sent', sentAt: new Date() }
           });
         } catch (e) {
-          console.error(`[Broadcast] Failed to send to recipient ${r.id}`, e);
+          console.error(`[Broadcast] Failed to process recipient ${r.id}`, e);
           await prismaAny.broadcastRecipient.update({
             where: { id: r.id },
             data: { status: 'failed', error: String(e) }
