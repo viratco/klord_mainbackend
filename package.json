@@ -25,10 +25,11 @@
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.19.2",
+    "firebase-admin": "^13.6.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
-    "puppeteer": "^24.20.0",
+    "puppeteer": "^24.34.0",
     "twilio": "^5.9.0"
   },
   "devDependencies": {

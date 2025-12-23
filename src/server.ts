@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import path from 'path';
-// Load only .env from parent directory
+// Load .env from both local and parent directory (local takes priority)
+dotenv.config({ path: path.join(process.cwd(), '.env') });
 dotenv.config({ path: path.join(process.cwd(), '..', '.env') });
 import express, { Request, Response } from 'express';
 import fs from 'fs';
@@ -12,15 +13,37 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcrypt';
 import { protect, AuthenticatedRequest } from './middleware/auth.js';
 import { JWT_SECRET } from './config.js';
-// Twilio OTP sending removed; using console OTP for development
+import admin from 'firebase-admin';
 import { generateCertificatePDF } from './services/certificateService.js';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-// WhatsApp sending removed per user request
+// Twilio OTP sending removed; using console OTP for development
 import { sendEmailOTP } from './services/emailService.js';
+
+// Simple in-memory OTP store (for development only)
+type OtpRecord = { code: string; expiresAt: number; attempts: number };
+const otpStore = new Map<string, OtpRecord>();
+const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const OTP_MAX_ATTEMPTS = 5;
 
 const app = express();
 const prisma = new PrismaClient();
+
+// Initialize Firebase Admin
+if (!admin.apps.length) {
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      }),
+    });
+    console.log('[Firebase Admin] Initialized successfully');
+  } catch (error) {
+    console.warn('[Firebase Admin] Initialization failed - verify-firebase-token will not work', error);
+  }
+}
 
 app.use(cors());
 // Explicit preflight for safety (some clients are picky on mobile networks)
@@ -597,7 +620,7 @@ app.post('/api/admin/staff/register', protect, async (req: AuthenticatedRequest,
   }
 });
 
-// Customer: Request OTP
+// Customer: Request OTP (Legacy endpoint - should be replaced by Firebase on frontend)
 app.post('/api/auth/request-otp', async (req: Request, res: Response) => {
   try {
     const { mobile } = req.body;
@@ -614,46 +637,103 @@ app.post('/api/auth/request-otp', async (req: Request, res: Response) => {
     otpStore.set(normalizedMobile, { code, expiresAt: Date.now() + OTP_TTL_MS, attempts: 0 });
 
     // In development, return OTP in response for testing
-    console.log(`[OTP] Generated for ${normalizedMobile}: ${code}`);
-    res.json({ message: 'OTP sent', otp: code }); // Remove 'otp' in production
+    console.log(`[OTP-Legacy] Generated for ${normalizedMobile}: ${code}`);
+    res.json({ message: 'Legacy OTP sent', otp: code });
   } catch (error) {
     console.error('[request-otp] Error:', error);
     res.status(500).json({ error: 'Failed to send OTP' });
   }
 });
 
-// Customer: Verify OTP and login (simple dev handler)
 app.post('/api/auth/verify-otp', async (req: Request, res: Response) => {
   try {
     const { mobile, otp, referralCode } = req.body ?? {};
-    if (!mobile || !otp) {
-      return res.status(400).json({ error: 'Mobile and OTP are required' });
-    }
-    const normalizedMobile = mobile.trim().replace(/\D+/g, '');
+    const normalizedMobile = mobile ? mobile.trim().replace(/\D+/g, '') : '';
     const referralCodeInput = normalizeReferralInput(referralCode);
 
-    const record = otpStore.get(normalizedMobile);
-    if (!record) {
-      return res.status(400).json({ error: 'OTP not requested' });
-    }
-    if (record.attempts >= OTP_MAX_ATTEMPTS) {
-      otpStore.delete(normalizedMobile);
-      return res.status(400).json({ error: 'Too many attempts' });
-    }
-    if (record.code !== otp.trim()) {
-      record.attempts++;
-      return res.status(400).json({ error: 'Invalid OTP' });
-    }
-    if (Date.now() > record.expiresAt) {
-      otpStore.delete(normalizedMobile);
-      return res.status(400).json({ error: 'OTP expired' });
+    // OTP valid, create/find customer with referral logic
+    let customerMobile = normalizedMobile;
+
+    if (req.body.firebaseToken) {
+      try {
+        const decodedToken = await admin.auth().verifyIdToken(req.body.firebaseToken);
+        if (decodedToken.phone_number) {
+          customerMobile = decodedToken.phone_number.replace(/\D+/g, '');
+        }
+      } catch (err) {
+        console.error('[verify-otp] Firebase token verification failed:', err);
+        return res.status(401).json({ error: 'Invalid or expired Firebase token' });
+      }
+    } else {
+      if (!mobile || !otp) {
+        return res.status(400).json({ error: 'Mobile and OTP are required' });
+      }
+      // Legacy custom OTP verification
+      const record = otpStore.get(normalizedMobile);
+      if (!record) {
+        return res.status(400).json({ error: 'OTP not requested' });
+      }
+      if (record.attempts >= OTP_MAX_ATTEMPTS) {
+        otpStore.delete(normalizedMobile);
+        return res.status(400).json({ error: 'Too many attempts' });
+      }
+      if (record.code !== otp.trim()) {
+        record.attempts++;
+        return res.status(400).json({ error: 'Invalid OTP' });
+      }
+      if (Date.now() > record.expiresAt) {
+        otpStore.delete(normalizedMobile);
+        return res.status(400).json({ error: 'OTP expired' });
+      }
+      otpStore.delete(normalizedMobile); // Clean up
     }
 
-    // OTP valid, create/find customer with referral logic
-    let customer = await (prisma as any).customer.findUnique({ where: { mobile: normalizedMobile } });
+    // --- AGGRESSIVE CUSTOMER MIGRATION (Multi-Account Merge) ---
+    let customer = null;
+    let legacyCustomer = null;
+    if (customerMobile.length > 10) {
+      const tenDigit = customerMobile.slice(-10);
+      legacyCustomer = await (prisma as any).customer.findUnique({ where: { mobile: tenDigit } });
+    }
+
+    // 2. Identify ALL accounts using the full number (including duplicates)
+    // Using findMany in case unique constraint is somehow not enforced (as seen in diagnostic)
+    const fullNumberAccounts = await (prisma as any).customer.findMany({ where: { mobile: customerMobile } });
+
+    // 3. If a legacy account exists, we MUST prioritize it because it has the historical leads
+    if (legacyCustomer) {
+      console.log(`[verify-otp] Found legacy account ${legacyCustomer.id} for 10-digit mobile.`);
+
+      // Move ANY other accounts out of the way to free up the full phone number
+      for (const other of fullNumberAccounts) {
+        if (other.id !== legacyCustomer.id) {
+          console.log(`[verify-otp] Clearing duplicate account ${other.id} to favor legacy.`);
+          try {
+            // Rename instead of delete to be safe (no data loss accidental)
+            await (prisma as any).customer.update({
+              where: { id: other.id },
+              data: { mobile: `MERGED_${Date.now()}_${other.mobile}` }
+            });
+          } catch (e) {
+            console.error(`[verify-otp] Failed to rename duplicate ${other.id}:`, e);
+          }
+        }
+      }
+
+      // Now upgrade legacy to the full number
+      customer = await (prisma as any).customer.update({
+        where: { id: legacyCustomer.id },
+        data: { mobile: customerMobile }
+      });
+      console.log(`[verify-otp] Successfully migrated legacy account ${customer.id} to ${customerMobile}`);
+    }
+    // 4. Default: If no legacy, just pick one of the full-number accounts or return first
+    else if (fullNumberAccounts.length > 0) {
+      customer = fullNumberAccounts[0];
+    }
 
     if (!customer) {
-      // New customer
+      // New customer (SignUp logic)
       const ownCode = await generateUniqueReferralCode();
       let referredById: string | null = null;
       let level = 0;
@@ -668,7 +748,7 @@ app.post('/api/auth/verify-otp', async (req: Request, res: Response) => {
 
       customer = await (prisma as any).customer.create({
         data: {
-          mobile: normalizedMobile,
+          mobile: customerMobile,
           referralCode: ownCode,
           ...(referredById ? { referredBy: referredById, level } : {}),
         },
@@ -700,7 +780,6 @@ app.post('/api/auth/verify-otp', async (req: Request, res: Response) => {
 
     // Generate JWT
     const token = jwt.sign({ sub: customer.id, type: 'customer' }, JWT_SECRET, { expiresIn: '7d' });
-    otpStore.delete(normalizedMobile); // Clean up
 
     res.json({
       token,
@@ -1262,10 +1341,7 @@ app.post('/api/admin/leads/:leadId/steps/add-content', protect, upload.fields([
 });
 
 // Simple in-memory OTP store (for development only)
-type OtpRecord = { code: string; expiresAt: number; attempts: number };
-const otpStore = new Map<string, { code: string; expiresAt: number; attempts: number }>();
-const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const OTP_MAX_ATTEMPTS = 5;
+// Twilio removed; always console-output OTP in dev
 
 // Twilio removed; always console-output OTP in dev
 
@@ -2664,108 +2740,7 @@ app.post('/api/auth/admin/verify-otp', async (req: Request, res: Response) => {
 
 
 
-// Request OTP (fake) for a mobile number
-app.post('/api/auth/request-otp', async (req: Request, res: Response) => {
-  try {
-    const { mobile } = req.body ?? {};
-    if (!mobile || typeof mobile !== 'string') {
-      return res.status(400).json({ error: 'mobile is required' });
-    }
-    // Very basic mobile format check
-    const normalized = mobile.replace(/\s+/g, '');
-    if (!/^\d{8,15}$/.test(normalized)) {
-      return res.status(400).json({ error: 'invalid mobile format' });
-    }
-
-    // Generate a fake OTP (for dev). You can fix it to 123456 if preferred.
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    otpStore.set(normalized, {
-      code,
-      expiresAt: Date.now() + OTP_TTL_MS,
-      attempts: 0,
-    });
-
-    console.log(`[request-otp][DEV] OTP for ${normalized} is ${code}`);
-    return res.json({ success: true, mobile: normalized, otp: code, ttlMs: OTP_TTL_MS, via: 'dev' });
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error('request-otp failed', err);
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
-
-// Verify OTP, create user (if needed), and return JWT
-app.post('/api/auth/verify-otp', async (req: Request, res: Response) => {
-  try {
-    const { mobile, otp } = req.body ?? {};
-    if (!mobile || typeof mobile !== 'string' || !otp || typeof otp !== 'string') {
-      return res.status(400).json({ error: 'mobile and otp are required' });
-    }
-    console.log(`[verify-otp] Received request for mobile: ${mobile}, otp: ${otp}`);
-
-    const normalized = mobile.replace(/\s+/g, '');
-    const storedOtp = otpStore.get(normalized);
-
-    console.log(`[verify-otp] Stored OTP data for ${normalized}:`, storedOtp);
-
-    if (!storedOtp) {
-      console.error(`[verify-otp] No OTP found for ${normalized}. It may have expired or was never requested.`);
-      return res.status(400).json({ error: 'OTP not requested or has expired' });
-    }
-
-    if (Date.now() > storedOtp.expiresAt) {
-      console.error(`[verify-otp] OTP for ${normalized} has expired.`);
-      otpStore.delete(normalized);
-      return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
-    }
-
-    if (storedOtp.attempts >= OTP_MAX_ATTEMPTS) {
-      console.error(`[verify-otp] Too many attempts for ${normalized}.`);
-      otpStore.delete(normalized);
-      return res.status(403).json({ error: 'Too many attempts. Please request a new OTP.' });
-    }
-
-    if (storedOtp.code !== otp.trim()) {
-      // Increment attempts
-      storedOtp.attempts += 1;
-      console.error(`[verify-otp] Invalid OTP for ${normalized}. Received: ${otp.trim()}, Expected: ${storedOtp.code}`);
-      return res.status(400).json({ error: 'Invalid OTP' });
-    }
-
-    console.log(`[verify-otp] OTP for ${normalized} is correct. Deleting from store.`);
-    // OTP correct; consume it
-    otpStore.delete(normalized);
-
-    // Find an existing customer or create a new one
-    let customer = await (prisma as any).customer.findUnique({
-      where: { mobile: normalized },
-    });
-
-    if (!customer) {
-      customer = await (prisma as any).customer.create({
-        data: { mobile: normalized },
-      });
-    }
-
-
-
-    // Issue JWT for the customer
-    const token = jwt.sign({ sub: customer.id, mobile: customer.mobile, type: 'customer' }, JWT_SECRET, {
-      expiresIn: '7d',
-    });
-
-    // Log success and delete OTP
-    console.log(`[verify-otp] Customer ${customer.id} authenticated successfully.`);
-    otpStore.delete(normalized);
-
-    // Return token and user object
-    res.json({ token, user: customer });
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error('verify-otp failed', err);
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
+// End of Mobile Auth Routes
 
 // Removed legacy inquiry create
 

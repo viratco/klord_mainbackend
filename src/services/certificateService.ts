@@ -32,11 +32,21 @@ export async function generateCertificatePDF(data: CertificateData): Promise<{ f
   }
 
   // Resolve background image path and embed as data URL to ensure Puppeteer loads it reliably
-  const distDefaultBg = path.join(__dirname, '..', 'templates', 'assets', 'certificate-bg.jpg');
-  const srcDefaultBg = path.join(process.cwd(), 'src', 'templates', 'assets', 'certificate-bg.jpg');
+  const distDefaultBg = path.join(__dirname, '..', 'templates', 'assets', 'certificate-bg.png');
+  const srcDefaultBg = path.join(process.cwd(), 'src', 'templates', 'assets', 'certificate-bg.png');
   const defaultBg = (await fileExists(distDefaultBg)) ? distDefaultBg : srcDefaultBg;
-  const envBg = process.env.CERTIFICATE_BG_PATH && String(process.env.CERTIFICATE_BG_PATH).trim();
-  const bgPath = envBg && envBg.length > 0 ? path.resolve(envBg) : defaultBg;
+
+  console.log('[certificate] DEBUG: distDefaultBg =', distDefaultBg, 'exists?', await fileExists(distDefaultBg));
+  console.log('[certificate] DEBUG: srcDefaultBg =', srcDefaultBg, 'exists?', await fileExists(srcDefaultBg));
+  console.log('[certificate] DEBUG: chosen defaultBg =', defaultBg);
+
+  // FORCE: Always use default path, ignore env variable
+  // const envBg = process.env.CERTIFICATE_BG_PATH && String(process.env.CERTIFICATE_BG_PATH).trim();
+  // const bgPath = (envBg && envBg.length > 0) ? path.resolve(envBg) : defaultBg;
+  const bgPath = defaultBg; // Always use default path
+
+  console.log('[certificate] DEBUG: final bgPath =', bgPath);
+
   try {
     const imgBuf = await fs.readFile(bgPath);
     const ext = (path.extname(bgPath) || '.jpg').toLowerCase();
@@ -44,11 +54,11 @@ export async function generateCertificatePDF(data: CertificateData): Promise<{ f
     const dataUrl = `data:${mime};base64,${imgBuf.toString('base64')}`;
     html = replaceAll(html, '__BG_DATA_URL__', dataUrl);
     // Debug: note data URL size
-    console.log(`[certificate] Using background ${bgPath} (${mime}), dataUrl length=${dataUrl.length}`);
+    console.log(`[certificate] SUCCESS! Using background ${bgPath} (${mime}), dataUrl length=${dataUrl.length}`);
   } catch (err) {
     // Fallback: no background if read fails
     html = replaceAll(html, '__BG_DATA_URL__', '');
-    console.warn(`[certificate] Failed to read CERTIFICATE_BG_PATH: ${bgPath}. Proceeding without background.`, err);
+    console.error(`[certificate] FAILED to read background image at: ${bgPath}`, err);
   }
 
   // Replace placeholders
@@ -104,7 +114,7 @@ export async function generateCertificatePDF(data: CertificateData): Promise<{ f
       ContentType: 'application/pdf',
     }));
     // Remove local PDF after successful upload (keep debug HTML for inspection)
-    await fs.unlink(outPath).catch(() => {});
+    await fs.unlink(outPath).catch(() => { });
     publicUrl = `https://${AWS_S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${encodeURIComponent(key)}`;
   }
 
