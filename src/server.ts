@@ -1401,8 +1401,9 @@ async function upsertWalletAdd(customerId: string, delta: number) {
 // Core distributor used by endpoints and booking hooks
 async function distributeCommissionForPurchase(sourceId: string, gross: number) {
   const settings = await getMlSettings();
-  const cap = (settings.maxPayoutPercent / 100) * gross;
-  const percents = [settings.level1Percent, settings.level2Percent, settings.level3Percent, settings.level4Percent ?? 2.0, settings.level5Percent ?? 2.0];
+  const cap = (10.0 / 100) * gross; // Force 10% cap
+  // Force 2% for all 5 levels
+  const percents = [2.0, 2.0, 2.0, 2.0, 2.0];
   const chain = await getUplineChain(sourceId, 5);
 
   const intended = chain.map((u, idx) => ({ uplineId: u.id, levelFromDownline: u.level, pct: percents[idx] ?? 0 }));
@@ -1462,6 +1463,10 @@ app.get('/api/referrals/overview', protect, async (req: AuthenticatedRequest, re
     const a2 = a1Ids.length ? await (prisma as any).customer.findMany({ where: { referredBy: { in: a1Ids } }, select: { id: true } }) : [];
     const a2Ids = a2.map((x: any) => x.id);
     const a3 = a2Ids.length ? await (prisma as any).customer.findMany({ where: { referredBy: { in: a2Ids } }, select: { id: true } }) : [];
+    const a3Ids = a3.map((x: any) => x.id);
+    const a4 = a3Ids.length ? await (prisma as any).customer.findMany({ where: { referredBy: { in: a3Ids } }, select: { id: true } }) : [];
+    const a4Ids = a4.map((x: any) => x.id);
+    const a5 = a4Ids.length ? await (prisma as any).customer.findMany({ where: { referredBy: { in: a4Ids } }, select: { id: true } }) : [];
 
     const commissions = await (prisma as any).commission.groupBy({
       by: ['levelFromDownline'],
@@ -1472,15 +1477,17 @@ app.get('/api/referrals/overview', protect, async (req: AuthenticatedRequest, re
     for (const c of commissions) sumByLevel[c.levelFromDownline] = c._sum.amount ?? 0;
 
     res.json({
-      counts: { a1: a1.length, a2: a2.length, a3: a3.length },
+      counts: { a1: a1.length, a2: a2.length, a3: a3.length, a4: a4.length, a5: a5.length },
       earnings: {
         a1: sumByLevel[1] ?? 0,
         a2: sumByLevel[2] ?? 0,
         a3: sumByLevel[3] ?? 0,
+        a4: sumByLevel[4] ?? 0,
+        a5: sumByLevel[5] ?? 0,
       },
       settings: {
-        maxPayoutPercent: settings.maxPayoutPercent,
-        levelPercents: [settings.level1Percent, settings.level2Percent, settings.level3Percent],
+        maxPayoutPercent: 10.0,
+        levelPercents: [2.0, 2.0, 2.0, 2.0, 2.0],
       },
     });
   } catch (err) {
@@ -1579,10 +1586,12 @@ app.get('/api/admin/referrals/overview', protect, async (req: AuthenticatedReque
       level2Percent: settings.level2Percent,
       level3Percent: settings.level3Percent
     } : {
-      maxPayoutPercent: 4.0,
+      maxPayoutPercent: 10.0,
       level1Percent: 2.0,
-      level2Percent: 1.0,
-      level3Percent: 1.0
+      level2Percent: 2.0,
+      level3Percent: 2.0,
+      level4Percent: 2.0,
+      level5Percent: 2.0
     };
 
     // Get network growth (last 12 months) - ALL customers
