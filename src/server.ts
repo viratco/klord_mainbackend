@@ -1611,56 +1611,73 @@ app.get('/api/admin/referrals/overview', protect, async (req: AuthenticatedReque
       });
     }
 
-    // Get ALL customers (top 50 by total downlines, including those with 0)
-    const allCustomers = await (prisma as any).customer.findMany({
+    // RECURSIVE CALCULATION FIX:
+    // 1. Fetch ALL users to build the full graph (needed for A2-A5 which are not in direct downlines)
+    const allUsersGraph = await (prisma as any).customer.findMany({
       select: {
         id: true,
+        referredBy: true,
         mobile: true,
         referralCode: true,
         level: true,
-        referredBy: true,
-        referredByCustomer: {
-          select: { id: true, mobile: true }
-        },
-        downlines: {
-          select: { id: true, level: true, referredBy: true }
-        },
-        commissionsReceived: {
-          select: { amount: true }
-        }
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 100 // Get top 100 to ensure we have enough data
+        createdAt: true,
+        commissionsReceived: { select: { amount: true } }
+      }
     });
 
-    const topReferrers = allCustomers
+    // 2. Build Adjacency List (Parent ID -> Children List)
+    const childrenMap = new Map<string, any[]>();
+    allUsersGraph.forEach((u: any) => {
+      if (u.referredBy) {
+        if (!childrenMap.has(u.referredBy)) childrenMap.set(u.referredBy, []);
+        childrenMap.get(u.referredBy)?.push(u);
+      }
+    });
+
+    // 3. Helper to count downlines by level depth
+    const getDownlineCounts = (rootId: string) => {
+      const counts = { a1: 0, a2: 0, a3: 0, a4: 0, a5: 0 };
+
+      const traverse = (currentId: string, depth: number) => {
+        if (depth > 5) return;
+        const children = childrenMap.get(currentId) || [];
+
+        children.forEach(child => {
+          if (depth === 1) counts.a1++;
+          else if (depth === 2) counts.a2++;
+          else if (depth === 3) counts.a3++;
+          else if (depth === 4) counts.a4++;
+          else if (depth === 5) counts.a5++;
+
+          traverse(child.id, depth + 1);
+        });
+      };
+
+      traverse(rootId, 1);
+      return counts;
+    };
+
+    // 4. Map the response using the graph
+    const topReferrers = allUsersGraph
       .map((c: any) => {
-        const totalReferrals = c.downlines.length;
+        const counts = getDownlineCounts(c.id);
+        const totalReferrals = counts.a1 + counts.a2 + counts.a3 + counts.a4 + counts.a5;
         const earnings = c.commissionsReceived.reduce((sum: number, comm: any) => sum + comm.amount, 0);
 
-        // A1 = DIRECT children only (those whose referredBy === this customer's ID)
-        // A2 = children of A1 members
-        // A3 = children of A2 members
-        const a1Count = c.downlines.filter((d: any) => d.referredBy === c.id).length;
-
-        // For A2 and A3, we need to check the level difference
-        const customerLevel = c.level || 0;
-        const a2Count = c.downlines.filter((d: any) => d.level === customerLevel + 2).length;
-        const a3Count = c.downlines.filter((d: any) => d.level === customerLevel + 3).length;
-        const a4Count = c.downlines.filter((d: any) => d.level === customerLevel + 4).length;
-        const a5Count = c.downlines.filter((d: any) => d.level === customerLevel + 5).length;
+        // Find upline details manually from graph
+        const uplineUser = c.referredBy ? allUsersGraph.find((u: any) => u.id === c.referredBy) : null;
 
         return {
           id: c.id,
           phoneNumber: c.mobile,
           referralCode: c.referralCode || 'N/A',
-          upline: c.referredByCustomer ? {
-            id: c.referredByCustomer.id,
-            phoneNumber: c.referredByCustomer.mobile
+          upline: uplineUser ? {
+            id: uplineUser.id,
+            phoneNumber: uplineUser.mobile
           } : null,
           totalReferrals,
           earnings,
-          downline: { a1: a1Count, a2: a2Count, a3: a3Count, a4: a4Count, a5: a5Count }
+          downline: counts
         };
       })
       .sort((a: any, b: any) => b.totalReferrals - a.totalReferrals)
@@ -1713,49 +1730,58 @@ app.get('/api/admin/referrals/user/:customerId', protect, async (req: Authentica
 
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
-    const totalReferrals = customer.downlines.length;
+    // RECURSIVE FETCH FOR USER DETAILS
+    // 1. Fetch entire network to traverse
+    const allUsers = await (prisma as any).customer.findMany({
+      select: {
+        id: true,
+        mobile: true,
+        referredBy: true,
+        createdAt: true
+      }
+    });
+
+    const childrenMap = new Map<string, any[]>();
+    allUsers.forEach((u: any) => {
+      if (u.referredBy) {
+        if (!childrenMap.has(u.referredBy)) childrenMap.set(u.referredBy, []);
+        childrenMap.get(u.referredBy)?.push(u);
+      }
+    });
+
+    // 2. Recursive helper to collect members by level
+    const a1: any[] = [];
+    const a2: any[] = [];
+    const a3: any[] = [];
+    const a4: any[] = [];
+    const a5: any[] = [];
+
+    const traverse = (currentId: string, depth: number) => {
+      if (depth > 5) return;
+      const children = childrenMap.get(currentId) || [];
+
+      children.forEach((child: any) => {
+        const mappedChild = {
+          id: child.id,
+          phoneNumber: child.mobile,
+          joinedAt: new Date(child.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+        };
+
+        if (depth === 1) a1.push(mappedChild);
+        else if (depth === 2) a2.push(mappedChild);
+        else if (depth === 3) a3.push(mappedChild);
+        else if (depth === 4) a4.push(mappedChild);
+        else if (depth === 5) a5.push(mappedChild);
+
+        traverse(child.id, depth + 1);
+      });
+    };
+
+    traverse(customer.id, 1);
+
+    // Calculate total Referrals from traversal
+    const totalReferrals = a1.length + a2.length + a3.length + a4.length + a5.length;
     const earnings = customer.commissionsReceived.reduce((sum: number, comm: any) => sum + comm.amount, 0);
-
-    // Categorize downlines by level
-    const a1 = customer.downlines
-      .filter((d: any) => d.level === customer.level + 1)
-      .map((d: any) => ({
-        id: d.id,
-        phoneNumber: d.mobile,
-        joinedAt: new Date(d.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
-      }));
-
-    const a2 = customer.downlines
-      .filter((d: any) => d.level === customer.level + 2)
-      .map((d: any) => ({
-        id: d.id,
-        phoneNumber: d.mobile,
-        joinedAt: new Date(d.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
-      }));
-
-    const a3 = customer.downlines
-      .filter((d: any) => d.level === customer.level + 3)
-      .map((d: any) => ({
-        id: d.id,
-        phoneNumber: d.mobile,
-        joinedAt: new Date(d.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
-      }));
-
-    const a4 = customer.downlines
-      .filter((d: any) => d.level === customer.level + 4)
-      .map((d: any) => ({
-        id: d.id,
-        phoneNumber: d.mobile,
-        joinedAt: new Date(d.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
-      }));
-
-    const a5 = customer.downlines
-      .filter((d: any) => d.level === customer.level + 5)
-      .map((d: any) => ({
-        id: d.id,
-        phoneNumber: d.mobile,
-        joinedAt: new Date(d.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
-      }));
 
     res.json({
       id: customer.id,
