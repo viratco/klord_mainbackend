@@ -1371,7 +1371,7 @@ async function getMlSettings() {
   if (!settings) {
     settings = await (prisma as any).mlSettings.create({ data: {} });
   }
-  return settings as { maxPayoutPercent: number; level1Percent: number; level2Percent: number; level3Percent: number };
+  return settings as { maxPayoutPercent: number; level1Percent: number; level2Percent: number; level3Percent: number; level4Percent: number; level5Percent: number };
 }
 
 async function getUplineChain(customerId: string, maxLevels = 3) {
@@ -1402,8 +1402,8 @@ async function upsertWalletAdd(customerId: string, delta: number) {
 async function distributeCommissionForPurchase(sourceId: string, gross: number) {
   const settings = await getMlSettings();
   const cap = (settings.maxPayoutPercent / 100) * gross;
-  const percents = [settings.level1Percent, settings.level2Percent, settings.level3Percent];
-  const chain = await getUplineChain(sourceId, 3);
+  const percents = [settings.level1Percent, settings.level2Percent, settings.level3Percent, settings.level4Percent ?? 2.0, settings.level5Percent ?? 2.0];
+  const chain = await getUplineChain(sourceId, 5);
 
   const intended = chain.map((u, idx) => ({ uplineId: u.id, levelFromDownline: u.level, pct: percents[idx] ?? 0 }));
   let amounts = intended.map(x => (x.pct / 100) * gross);
@@ -1647,6 +1647,8 @@ app.get('/api/admin/referrals/overview', protect, async (req: AuthenticatedReque
         const customerLevel = c.level || 0;
         const a2Count = c.downlines.filter((d: any) => d.level === customerLevel + 2).length;
         const a3Count = c.downlines.filter((d: any) => d.level === customerLevel + 3).length;
+        const a4Count = c.downlines.filter((d: any) => d.level === customerLevel + 4).length;
+        const a5Count = c.downlines.filter((d: any) => d.level === customerLevel + 5).length;
 
         return {
           id: c.id,
@@ -1658,7 +1660,7 @@ app.get('/api/admin/referrals/overview', protect, async (req: AuthenticatedReque
           } : null,
           totalReferrals,
           earnings,
-          downline: { a1: a1Count, a2: a2Count, a3: a3Count }
+          downline: { a1: a1Count, a2: a2Count, a3: a3Count, a4: a4Count, a5: a5Count }
         };
       })
       .sort((a: any, b: any) => b.totalReferrals - a.totalReferrals)
@@ -1739,6 +1741,22 @@ app.get('/api/admin/referrals/user/:customerId', protect, async (req: Authentica
         joinedAt: new Date(d.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
       }));
 
+    const a4 = customer.downlines
+      .filter((d: any) => d.level === customer.level + 4)
+      .map((d: any) => ({
+        id: d.id,
+        phoneNumber: d.mobile,
+        joinedAt: new Date(d.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+      }));
+
+    const a5 = customer.downlines
+      .filter((d: any) => d.level === customer.level + 5)
+      .map((d: any) => ({
+        id: d.id,
+        phoneNumber: d.mobile,
+        joinedAt: new Date(d.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+      }));
+
     res.json({
       id: customer.id,
       phoneNumber: customer.mobile,
@@ -1749,7 +1767,7 @@ app.get('/api/admin/referrals/user/:customerId', protect, async (req: Authentica
       } : null,
       totalReferrals,
       earnings,
-      downline: { a1, a2, a3 }
+      downline: { a1, a2, a3, a4, a5 }
     });
   } catch (err) {
     console.error('[admin] user referral detail failed', err);

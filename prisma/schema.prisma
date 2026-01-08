@@ -243,10 +243,12 @@ model Commission {
 
 model MlSettings {
   id               String   @id @default(cuid())
-  maxPayoutPercent Float    @default(4.0) // max payout across all levels
+  maxPayoutPercent Float    @default(10.0) // max payout across all levels (5 levels * 2%)
   level1Percent    Float    @default(2.0) // A1
-  level2Percent    Float    @default(1.0) // A2
-  level3Percent    Float    @default(1.0) // A3
+  level2Percent    Float    @default(2.0) // A2
+  level3Percent    Float    @default(2.0) // A3
+  level4Percent    Float    @default(2.0) // A4
+  level5Percent    Float    @default(2.0) // A5
   updatedAt        DateTime @updatedAt
 }
 
