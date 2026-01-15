@@ -48,7 +48,8 @@ if (!admin.apps.length) {
 app.use(cors());
 // Explicit preflight for safety (some clients are picky on mobile networks)
 app.options('*', cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // File uploads setup
 const multer: any = multerPkg as any;
