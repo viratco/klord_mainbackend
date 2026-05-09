@@ -3588,22 +3588,22 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('Server started with real-time dueDays calculation (no cron needed).');
 });
 
-// HTTPS Setup
-const certPath = '/etc/letsencrypt/live/api.klordenergy.com/fullchain.pem';
-const keyPath = '/etc/letsencrypt/live/api.klordenergy.com/privkey.pem';
-
-if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
-  try {
-    const options = {
-      key: fs.readFileSync(keyPath),
-      cert: fs.readFileSync(certPath)
-    };
-    https.createServer(options, app).listen(443, () => {
-      console.log("HTTPS Server running at https://api.klordenergy.com");
-    });
-  } catch (err) {
-    console.error("Failed to start HTTPS server:", err);
-  }
-} else {
-  console.warn("HTTPS certificates not found at /etc/letsencrypt/live/api.klordenergy.com/. Skipping HTTPS server.");
-}
+// HTTPS Setup (Commented out because Nginx handles SSL termination)
+// const certPath = '/etc/letsencrypt/live/api.klordenergy.com/fullchain.pem';
+// const keyPath = '/etc/letsencrypt/live/api.klordenergy.com/privkey.pem';
+// 
+// if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+//   try {
+//     const options = {
+//       key: fs.readFileSync(keyPath),
+//       cert: fs.readFileSync(certPath)
+//     };
+//     https.createServer(options, app).listen(443, () => {
+//       console.log("HTTPS Server running at https://api.klordenergy.com");
+//     });
+//   } catch (err) {
+//     console.error("Failed to start HTTPS server:", err);
+//   }
+// } else {
+//   console.warn("HTTPS certificates not found at /etc/letsencrypt/live/api.klordenergy.com/. Skipping HTTPS server.");
+// }
